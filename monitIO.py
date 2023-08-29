@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 
 # todo: size limitations for logs?
-# todo: print total in default.log all the time + average speed etc
+# todo: print default logging all the time + average speed etc
 
 import psutil
 import time
 import datetime
-
+import subprocess
 import os
-import pandas as pd
+import threading
+import re
 
+import pandas as pd
 from utils import get_size
 
 # default values
 updateInterval = 10
-
 
 def default_logging(stats: dict) -> None:
     """
@@ -42,11 +43,9 @@ def default_logging(stats: dict) -> None:
     print(f'{stats["interface"]} statistic:')
     print(f"time: {runtime.total_seconds()}s, sent: {get_size(total_sent)}, received: {get_size(total_rec)}, "
           f"average downstream over whole time of measurement: {get_size(avg_speed)}/s")
-    # TODO: write to file
 
 
 def watch_interfaces(arg_dict: dict) -> None:
-    # todo: add ram monitoring for max log size + termination
     """
     Function to continuously monitor the network traffic of one or more interfaces.
     If a log file is specified, it will be also written to file per interface.
@@ -61,6 +60,10 @@ def watch_interfaces(arg_dict: dict) -> None:
     -------
     None
     """
+    # todo: add ram monitoring for max log size + termination
+
+    test = pd.DataFrame()
+
     updateInterval = arg_dict["update"]
     io = psutil.net_io_counters(pernic=True,
                                 nowrap=True)  # https://www.educative.io/answers/what-is-the-psutilnetiocounters-method
@@ -76,6 +79,7 @@ def watch_interfaces(arg_dict: dict) -> None:
         if diff:  # if not empty -> unknown interface
             print(f"ERROR! unknown interface(s): {diff}!\nPlease select from the following:")
             print(all_interfaces)
+            exit()
     else:
         provided_interfaces = list(psutil.net_if_addrs().keys())
 
@@ -122,13 +126,12 @@ def watch_interfaces(arg_dict: dict) -> None:
                         # add current data to interface dfs
                         current = {
                             "timestamp": now,
-                            "download": get_size(io_new[interface].bytes_recv),
-                            "upload": get_size(io_new[interface].bytes_sent),
-                            "upstream": get_size(up / updateInterval),
-                            "downstream": get_size(down / updateInterval),
+                            "download": io_new[interface].bytes_recv,
+                            "upload": io_new[interface].bytes_sent,
+                            "upstream": up / updateInterval,
+                            "downstream": down / updateInterval,
                         }
-                        accumulated_data[interface] = accumulated_data[interface].append(current,
-                                                                                         ignore_index=True)  # TODO: can be optimized!
+                        accumulated_data[interface] = accumulated_data[interface].append(current, ignore_index=True)  # TODO: can be optimized!
 
             # update the I/O stats for the next iteration
             io = io_new
@@ -208,13 +211,14 @@ def watch_total(arg_dict: dict) -> None:
                           }
                          )
             default_logging(stats)
-            # TODO: evtl: add plotting?
+            # TODO: add plotting?
             exit()
 
 
 def watch_process(arg_dict: dict) -> None:
     """
-    Function to watch
+    Function to watch a process, specified with --pid/-p.
+
     Parameters
     ----------
     arg_dict: dict
@@ -224,4 +228,74 @@ def watch_process(arg_dict: dict) -> None:
     -------
     None
     """
-    pass
+    # TODO: exchange write to file with pandas df
+    # TODO plotting
+    # TODO add total stats with default logging
+
+    ###################################################
+    # for threading
+    downstream = 0
+    total_bytes = 0
+    stop_monitoring = threading.Event()
+    args = arg_dict
+    ###################################################
+
+
+
+    def get_bandwidth() -> None:  # interval: int
+        nonlocal downstream, stop_monitoring, args
+
+        with open("logs/process.log", "a") as f:
+            while not stop_monitoring.is_set():
+                bandwidth = downstream / args["update"]  # Bytes received in the last second
+
+                if arg_dict["logtofile"]:
+                    now = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+                    write_str = f"{now}, {bandwidth}\n"
+                    f.write(write_str)
+
+                os.system("cls") if "nt" in os.name else os.system("clear")
+                print(f"Downstream bandwidth (pid: {args['pid']}): {get_size(int(bandwidth))} /s")
+                downstream = 0  # Reset for the next interval
+                threading.Event().wait(args["update"])  # Wait for 1 second
+
+    def monitor_network_traffic() -> None:
+        nonlocal downstream, total_bytes, args
+
+        cmd = ["strace", "-e", "trace=recvfrom", "-p", args["pid"]]  # send or recvfrom ...
+
+        # Start a background thread to print total bytes every second
+        threading.Thread(target=get_bandwidth).start()  # (interval)
+
+        with subprocess.Popen(cmd, stderr=subprocess.PIPE, universal_newlines=True) as process:
+
+            for line in process.stderr:
+                # match = re.search(r'(recv|recvfrom).*=\s+(\d+)$', line)
+                match = re.search(r'=\s+(\d+)$', line)
+                if match:
+                    bytes_received = int(match.group(1))
+                    # bytes_received = int(match.group(2))
+                    downstream += bytes_received
+                    total_bytes += bytes_received
+
+    start = datetime.datetime.now()
+
+    try:
+        monitor_network_traffic()
+    except KeyboardInterrupt:
+        # do things
+        end = datetime.datetime.now()
+        stop_monitoring.set()
+        print("stopping...")
+        """
+        print("Keyboard interrupt... Processing please wait!")
+        stats.update({"end_time": datetime.datetime.now(),
+                      "end_sent": io_new.bytes_sent,
+                      "end_rec": io_new.bytes_recv,
+                      "interface": "total",
+                      }
+                     )
+        default_logging(stats)
+        # TODO: evtl: add plotting?
+        """
+        exit()

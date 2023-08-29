@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-python3 -m venv monitoring
+python3.9 -m venv monitoring
 source monitoring/bin/activate
 pip install pip --upgrade
-pip install psutil scapy pandas
+pip install psutil pandas matplotlib
 
