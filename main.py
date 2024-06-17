@@ -62,7 +62,6 @@ def main() -> None:
         # ----- write_config -----
         # WriteOut
         WriteOut = dict(config.items('WriteOut'))
-        WriteOut["mode"] = [element.strip().lower() for element in WriteOut["mode"].split(',') if element.strip()]
         # Influx
         Influx = dict(config.items('Influx'))
         # File
@@ -71,7 +70,6 @@ def main() -> None:
         Json = dict(config.items('Json'))
         # combine
         write_config = WriteOut | Influx | File | Json
-        exit(write_config)
 
     # ------------------------------------
     # ----- Setup logging and config -----
@@ -92,10 +90,13 @@ def main() -> None:
         gather_interface_info(logger, args["interfaces"])
 
     if args["config"]:
-        logger.info(f'No config provided. Writing mode disabled.')
-        monitor_and_send(logger, write_config)
+        logger.info(f'Config provided. Writing mode enabled.')
+        try:
+            monitor_and_send(logger, args["interfaces"], write_config)
+        except Exception as e:
+            exit(f'Smth went wrong!: {e}')
     else:
-        logger.warning(f'No config file provided. Writing mode disabled.')
+        logger.warning(f'No config file provided. Running interactively.')
         monitor_interactive(logger, args["interfaces"], update_interval=args["update"])
 
 
