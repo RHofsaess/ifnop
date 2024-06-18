@@ -224,14 +224,16 @@ def monitor_and_send(logger: logging.Logger, selected_interfaces: list, write_co
             influx_url = write_config["influx_url"]
             influx_bucket = write_config["influx_bucket"]
             influx_org = write_config["influx_org"]
-            influx_token = write_config["influx_token"]
             influx_measurement = write_config["influx_measurement"]
             influx_tags = write_config["influx_tags"]
+            influx_token = write_config["influx_token"]
+            if 'INFLUX_TOKEN' in os.environ:  # for deployment via docker image
+                logger.debug(f'Overwriting influx_token from config with env variable.')
+                influx_token = os.environ['INFLUX_TOKEN']
 
             # validate tags:
-            if write_config["influx_tags"] != "hostname":
-                tags = [element.strip().lower() for element in write_config["influx_tags"].split(',') if
-                        element.strip()]
+            if influx_tags != "hostname":
+                tags = [element.strip().lower() for element in influx_tags.split(',') if element.strip()]
                 logger.warning(f'Non-default tags used: {tags}')
             else:  # default: hostname
                 tags = socket.gethostname()
