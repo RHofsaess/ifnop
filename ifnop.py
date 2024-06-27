@@ -3,6 +3,7 @@ import datetime
 import logging
 import os
 import socket
+import subprocess
 
 import psutil
 import pandas
@@ -13,7 +14,7 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 from utils import get_size
 
 
-# ---------- HELPER ----------
+# -------------------- HELPER --------------------
 def process_interface_list(logger: logging.Logger, provided_interfaces: str = '') -> list:
     """
     Helper function to process a provided interface list.
@@ -51,7 +52,74 @@ def process_interface_list(logger: logging.Logger, provided_interfaces: str = ''
     return selected_interfaces
 
 
-# ------------ | -------------
+def find_pid(logger: logging.Logger, name: str) -> int:
+    """
+    Returns the processes pid. If the process does not exist, there are multiple ones, or the process is inactive,
+
+    Parameters
+    ----------
+    logger: logging.Logger
+        Default logger
+    name:str
+        Name of the process
+    Returns
+    -------
+    pid: int
+        Process id or -999 on error
+    """
+    ps = []
+    for proc in psutil.process_iter(['pid', 'name', 'status']):
+        if proc.info['name'] == name:
+            ps.append(proc)
+    logger.debug(f'Found processes:\n{ps}')
+    if len(ps) < 1:
+        ps = []
+        for proc in psutil.process_iter(['pid', 'name', 'status']):
+            # Check if 'name' is part of the process name, case-insensitive
+            if name.lower() in proc.info['name'].lower():
+                ps.append(proc)
+        logger.warning(f'No process found! Did you may mean one of:\n{ps}')
+        return -999
+    elif len(ps) > 1:
+        logger.warning(f'Multiple processes found! Unclear which one to monitor.\n{ps}')
+        return -999
+    else:
+        pid = ps[0].info["pid"]
+        logger.info(f'Found process: {pid}')
+        if ps[0].info["status"] != "active":
+            logger.warning(f'Process {pid} not active.')
+            # return -999  # TODO: review later
+        return pid
+
+
+def get_fd_count(logger: logging.Logger, pid: int) -> int:
+    """
+    Get the total number of file handles with lsof
+
+    Parameters
+    ----------
+    logger: logging.Logger
+        Default logger
+    pid: int
+        ID of the process to be monitored
+
+    Returns
+    -------
+    int
+        Number of file descriptor; 0 if faulty
+    """
+    try:
+        # Build the command string with shell=True
+        command = f'lsof -p {pid} | wc -l'
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True, check=True
+        )
+        return int(result.stdout.strip())
+    except subprocess.CalledProcessError as e:
+        logger.warning(f'Error running lsof: {e}')
+    return 0
+
+# ---------------------- | -----------------------
 
 
 # TODO add interface infos to be printed
@@ -127,9 +195,10 @@ def monitor_and_send(logger: logging.Logger, selected_interfaces: list, write_co
 
     **Note: This is for now only usable with a file based config. CLI can only be used for interactive monitoring!**
 
-    Configuration: write_config
+    Configuration:
     The **write_config** is a subset of the whole config containing [WriteOut] and [Cred].\n
     - mode: [json, influx, file] [default: -]\n
+    - monit_io: additionally monit IO ops and open file handles for a chosen process.\n
     - outputfile: name for output file, if defined [default: -]\n
     - update: defines the update interval  [default: 10]\n
     - batchsize: nummer of data points that should be collected before writing [default: 1]\n
@@ -142,20 +211,24 @@ def monitor_and_send(logger: logging.Logger, selected_interfaces: list, write_co
     - influx_measurement\n
     - influx_tags
 
-    The batch size defines, after how many data points, the buffer should be flushed, e.g.\n
-    update = 30, batchsize = 10 => after 300s, 10 data points are written and buffers are flushed.
+    The batch size defines, after how many data points the buffer should be flushed, e.g.\n
+    update = 30, batchsize = 10 => after 300s, 10 sets of data points (one per interface) are written and buffers are flushed.
     By this, the RAM consumption should be kept small.
 
     Parameters
     ----------
-    logger
-    selected_interfaces
-    write_config
+    logger: logging.Logger
+        Default logger
+    selected_interfaces: list
+        Filter list with the selected interfaces
+    write_config: dict
+        Subset of the config file that contains everything for writing/sending
 
     Returns
     -------
     None
     """
+
     # ---------------------------------------- Helper functions ----------------------------------------
     def convert_unix_to_influx_timestamp(unix_time: int) -> datetime.datetime.strftime:
         """Converts a Unix timestamp to a timestamp format that InfluxDB understands."""
@@ -163,33 +236,56 @@ def monitor_and_send(logger: logging.Logger, selected_interfaces: list, write_co
         influx_timestamp = dt.strftime('%Y-%m-%dT%H:%M:%SZ')
         return influx_timestamp
 
-    def create_influx_point(logger: logging.Logger, _measurement: str, _tags: str, entry) -> Point:
-        """Create an influx Point from the data."""
+    # TODO: generalize for other indexes; now: timestamp is hardcoded
+    def create_influx_point(logger: logging.Logger, _measurement: str, tag_list: list, fields: dict) -> Point:
+        """
+        Create an influx Point from the data.
+
+        Parameters
+        ----------
+        logger:
+
+        _measurement:
+
+        tag_list: list
+            List of tuples
+        fields: dict
+
+        Returns
+        -------
+
+        """
         try:
             point = Point(_measurement)
-            point.tag("host", _tags)  # fixed tag from config
-            point.tag("interface", entry.get("interface"))  # per selected interface
-            point.time(entry["timestamp"], WritePrecision.NS)  # index -> necessary
-            point.field("upload", entry.get("upload"))
-            point.field("download", entry.get("download"))
-            point.field("upstream", entry.get("upstream"))
-            point.field("downstream", entry.get("downstream"))
+            for tag, value in tag_list:
+                point.tag(tag, value)  # e.g. host, lx29
+
+            for key, value in fields.items():
+                if key != "timestamp" and key != "interface":  # exclude index and tags
+                    point.field(key, value)
+
+            point.time(fields["timestamp"], WritePrecision.NS)  # index -> necessary
 
             msg = 'Created InfluxDB point: ' + point.to_line_protocol()
-            #logger.debug(f'{msg}')  # DEBUG: very spammy!
+            logger.debug(f'{msg}')  # DEBUG: very spammy!
             return point
         # If None: for now: skip point; later: proper error handling #TODO
         except KeyError as e:
             logger.warning(
-                f"Missing key {e} for interface {interface} at timestamp {entry.get('timestamp', 'unknown')}")
+                f'Missing key {e} for interface {fields.get("interface", "unknown")} at timestamp '
+                f'{fields.get("timestamp", "unknown")}')
             return None
         except Exception as e:
             # General error handling
-            logger.warning(f"An error occurred while processing data for interface {interface}: {e}")
+            logger.warning(f'An error occurred while processing data for interface '
+                           f'{fields.get("interface", "unknown")}: {e}')
             return None
+
     # ---------------------------------------- | ----------------------------------------
 
-    # read in and sanitize config
+    ###############################
+    # read in and sanitize config #
+    ###############################
     logger.debug(f'[monitor_and_send] Reading in the write config...')
     logger.debug(f'Full write config:\n {write_config}')
 
@@ -200,6 +296,18 @@ def monitor_and_send(logger: logging.Logger, selected_interfaces: list, write_co
         batchsize = int(write_config["batchsize"])
     except Exception as e:
         exit(f'Error: {e} missing in config.')
+
+    # IO
+    enable_io_monit = False
+    if write_config["monit_io"]:
+        # get PID of configured process
+        pid = find_pid(logger, write_config["process"])
+        if pid == -999:
+            logger.warning('An error occurred with the IO monitoring. Increase the loglevel for more info. IO '
+                           'monitoring disabled.')
+        else:
+            logger.info(f'IO monitoring enabled for pid: {pid}')
+            enable_io_monit = True
 
     # File: to be implemented
     if "file" in mode:
@@ -231,13 +339,16 @@ def monitor_and_send(logger: logging.Logger, selected_interfaces: list, write_co
                 logger.debug(f'Overwriting influx_token from config with env variable.')
                 influx_token = os.environ['INFLUX_TOKEN']
 
-            # validate tags:
+            # validate and set tags from config:
+            tag_list = []  # list of tag tuples
             if influx_tags != "hostname":
-                tags = [element.strip().lower() for element in influx_tags.split(',') if element.strip()]
-                logger.warning(f'Non-default tags used: {tags}')
+                #tags = [element.strip().lower() for element in influx_tags.split(',') if element.strip()]  #TODO
+                # pass as given
+                tag_list.append((influx_tags, influx_tags))
+                logger.warning(f'Non-default tags used: {tag_list}')
             else:  # default: hostname
-                tags = socket.gethostname()
-                logger.debug(f'Default: hostname selected as tag: {tags}')
+                tag_list.append(("host", socket.gethostname()))
+                logger.debug(f'Default: hostname selected as tag: {tag_list}')
         except Exception as e:
             exit(f'ERROR: {e} missing in config.')
 
@@ -245,9 +356,11 @@ def monitor_and_send(logger: logging.Logger, selected_interfaces: list, write_co
         client = InfluxDBClient(url=influx_url, token=influx_token, org=influx_org)
         write_api = client.write_api(write_options=SYNCHRONOUS)
 
-    # ---------------------------------------
-    # ---------- Start measurement ----------
-    # ---------------------------------------
+    logger.info('+++++++ Configuration successful! +++++++')
+
+    #####################
+    # Start measurement #
+    #####################
     stats = []  # for total statistics in the end
     accumulated_data = {}  # dict containing a list of the data dicts for each interface for "file" and "json" mode
     influx_batch = []  # List of points to be pushed per batch
@@ -258,29 +371,69 @@ def monitor_and_send(logger: logging.Logger, selected_interfaces: list, write_co
     msg = "Starting measurement at: " + start.strftime('%Y-%m-%d_%H-%M-%S')
     logger.info(f'{msg}')
 
-    io = psutil.net_io_counters(pernic=True,
+    # TODO: try except blog also on init + refactor the init block!
+    bw = psutil.net_io_counters(pernic=True,
                                 nowrap=True)  # https://www.educative.io/answers/what-is-the-psutilnetiocounters-method
-
-    for interface, interface_io in io.items():
+    for interface, interface_io in bw.items():
         # use provided interface list
         if interface in selected_interfaces:
-
-            up, down = io[interface].bytes_sent - interface_io.bytes_sent, io[
+            up, down = bw[interface].bytes_sent - interface_io.bytes_sent, bw[
                 interface].bytes_recv - interface_io.bytes_recv
 
-            if "file" in mode:
+            if "file" in mode: #TODO + json
                 accumulated_data[interface] = []  # create a list per interface to be filled with the data dicts
                 # add init values per dict
-                accumulated_data[interface].append(dict(timestamp=start, upload=io[interface].bytes_sent,
-                                                        download=io[interface].bytes_recv,
+                accumulated_data[interface].append(dict(timestamp=start, upload=bw[interface].bytes_sent,
+                                                        download=bw[interface].bytes_recv,
                                                         upstream=up / update_interval,
                                                         downstream=down / update_interval)
                                                    )
+            if "influx" in mode:
+                # Create point and add to batch
+                data_point = dict(interface=interface, timestamp=start_influx,
+                                  upload=bw[interface].bytes_sent,
+                                  download=bw[interface].bytes_recv,
+                                  upstream=up / update_interval, downstream=down / update_interval)
+                influx_batch.append(create_influx_point(logger, influx_measurement, tag_list + [("interface", interface)],
+                                                        data_point))
+
             # Write start values for final statistics
             stats.append(dict(interface=interface, time=start,
-                              sent=io[interface].bytes_sent, rec=io[interface].bytes_recv))
+                              sent=bw[interface].bytes_sent, rec=bw[interface].bytes_recv))
+
+    # if I/O monitoring is configured
+    if enable_io_monit:
+        # TODO: differentiate between influx and other modes
+        try:
+            process = psutil.Process(pid)
+            files = process.open_files()  # actual number of open files, not fds!
+            logger.debug(f'Number of open files: {len(files)}')
+            #logger.debug(f'Open files:\n {files}')  # DEBUG spammy!
+
+            # Get the number of file descriptors using lsof
+            fd_count = get_fd_count(logger, pid)
+            if fd_count is not None:
+                logger.debug(f'Total file descriptors open by process {pid}: {fd_count}')
+            else:
+                logger.warning('Failed to retrieve file descriptor count.')
+
+            io = process.io_counters()
+            data_point = dict(n_open_files=len(files), fd_count=fd_count, timestamp=start_influx,
+                              read_count=io.read_count,
+                              write_count=io.write_count, bytes_read=io.read_bytes,
+                              bytes_write=io.write_bytes, r_rate=0, w_rate=0)
+            influx_batch.append(create_influx_point(logger, influx_measurement, tag_list, data_point))
+
+            # add start data to stats
+            stats.append(data_point)
+        except psutil.NoSuchProcess:
+            logger.warning(f'Process with PID {pid} has terminated.')
+        except Exception as e:
+            logger.warning(f'An error occurred for PID {pid}: {e}')
+
     logger.debug(f'Start data: {stats}')
 
+    # run measurement until <ctrl+c>
     try:
         while True:
             while batch_counter < batchsize:
@@ -288,20 +441,23 @@ def monitor_and_send(logger: logging.Logger, selected_interfaces: list, write_co
 
                 now = datetime.datetime.now()
                 now_influx = convert_unix_to_influx_timestamp(int(now.timestamp()))
-                io_new = psutil.net_io_counters(pernic=True, nowrap=True)
+                bw_new = psutil.net_io_counters(pernic=True, nowrap=True)
 
+                # -------------------- #
+                # bandwidth monitoring #
+                # -------------------- #
                 current_data = []
-                for interface, interface_io in io.items():
+                for interface, interface_io in bw.items():
                     if interface in selected_interfaces:
-                        up, down = (io_new[interface].bytes_sent - interface_io.bytes_sent,
-                                    io_new[interface].bytes_recv - interface_io.bytes_recv
+                        up, down = (bw_new[interface].bytes_sent - interface_io.bytes_sent,
+                                    bw_new[interface].bytes_recv - interface_io.bytes_recv
                                     )
                         if "file" in mode or "json" in mode:  # TODO
                             current_data.append({
                                 "interface": interface,
                                 "timestamp": now_influx,
-                                "upload": io_new[interface].bytes_sent,
-                                "download": io_new[interface].bytes_recv,
+                                "upload": bw_new[interface].bytes_sent,
+                                "download": bw_new[interface].bytes_recv,
                                 "upstream": up / update_interval,
                                 "downstream": down / update_interval,
                             })
@@ -309,13 +465,48 @@ def monitor_and_send(logger: logging.Logger, selected_interfaces: list, write_co
                         if "influx" in mode:
                             # Create point and add to batch
                             data_point = dict(interface=interface, timestamp=now_influx,
-                                              upload=io_new[interface].bytes_sent,
-                                              download=io_new[interface].bytes_recv,
+                                              upload=bw_new[interface].bytes_sent,
+                                              download=bw_new[interface].bytes_recv,
                                               upstream=up / update_interval, downstream=down / update_interval)
-                            influx_batch.append(create_influx_point(logger, influx_measurement, tags,
-                                                                    data_point))
-                # update the I/O stats for the next iteration
-                io = io_new
+                            influx_batch.append(
+                                create_influx_point(logger, influx_measurement, tag_list + [("interface", interface)],
+                                                    data_point))
+
+                # update the bandwidth stats for the next iteration
+                bw = bw_new
+
+                # -------------- #
+                # I/O monitoring #
+                # -------------- #
+                if enable_io_monit:
+                    try:
+                        process = psutil.Process(pid)
+                        files = process.open_files()
+                        logger.debug(f'Number of open files: {len(files)}')
+                        # logger.debug(f'Open files:\n {files}')  # DEBUG spammy!
+
+                        # Get the number of file descriptors using lsof
+                        fd_count = get_fd_count(logger, pid)
+                        if fd_count is not None:
+                            logger.debug(f'Total file descriptors open by process {pid}: {fd_count}')
+                        else:
+                            logger.warning('Failed to retrieve file descriptor count.')
+
+                        io_new = process.io_counters()
+                        print("WRITE:\n", io_new.write_bytes,io.write_bytes, (io_new.write_bytes - io.write_bytes) / update_interval)
+                        data_point = dict(n_open_files=len(files), fd_count=fd_count, timestamp=now_influx,
+                                          read_count=io_new.read_count, write_count=io_new.write_count,
+                                          bytes_read=io_new.read_bytes, bytes_write=io_new.write_bytes,
+                                          r_rate=(io_new.read_bytes-io.read_bytes) / update_interval,
+                                          w_rate=(io_new.write_bytes-io.write_bytes) / update_interval)
+                        influx_batch.append(create_influx_point(logger, influx_measurement, tag_list, data_point))
+
+                        # update the bandwidth stats for the next iteration
+                        io = io_new
+                    except psutil.NoSuchProcess:
+                        logger.warning(f"Process with PID {pid} has terminated.")
+                    except Exception as e:
+                        logger.warning(f"An error occurred for PID {pid}: {e}")
 
                 batch_counter = batch_counter + 1
             # write batch
@@ -342,15 +533,16 @@ def monitor_and_send(logger: logging.Logger, selected_interfaces: list, write_co
             client.close()
 
         # total stats  # TODO
-        io = psutil.net_io_counters(pernic=True,
+        bw = psutil.net_io_counters(pernic=True,
                                     nowrap=True)  # https://www.educative.io/answers/what-is-the-psutilnetiocounters-method
-        for interface, interface_io in io.items():
+        for interface, interface_io in bw.items():
             # use provided interface list
             if interface in selected_interfaces:
-                up, down = io[interface].bytes_sent - interface_io.bytes_sent, io[
+                up, down = bw[interface].bytes_sent - interface_io.bytes_sent, bw[
                     interface].bytes_recv - interface_io.bytes_recv
                 stats.append(dict(interface=interface, time=now,
-                                  sent=io[interface].bytes_sent, rec=io[interface].bytes_recv))
+                                  sent=bw[interface].bytes_sent, rec=bw[interface].bytes_recv))
+                #TODO add I/O stats
         exit('Terminated...')
 
         # TODO maybe add:
@@ -368,15 +560,18 @@ def monitor_and_send(logger: logging.Logger, selected_interfaces: list, write_co
 
         # for total, stats only contains one dict, so we directly access it via [0]
         stats[0].update(  # TODO: PER INTERFACE! (not [0]!)
-            dict(end_time=datetime.datetime.now(), end_sent=io_new.bytes_sent, end_rec=io_new.bytes_recv)
+            dict(end_time=datetime.datetime.now(), end_sent=bw_new.bytes_sent, end_rec=bw_new.bytes_recv)
         )
         show_stats(stats)
         exit()
         """
+
+
 ########################################################################################################################
 
 
 # TODO: not reviewed and refactored yet
+# TODO: add IO monitoring from args[]
 def monitor_interactive(logger: logging.Logger, selected_interfaces: list,
                         output_file: str = '', update_interval: int = 10) -> None:
     """

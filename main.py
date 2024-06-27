@@ -37,6 +37,7 @@ def main() -> None:
                         help="Enable logging to a file. If given without argument, it defaults to an empty string.")
     parser.add_argument('-l', '--loglevel', type=str, choices=['DEBUG', 'INFO', 'WARNING'], default='WARNING',
                         help="Set the logging level (e.g., DEBUG > INFO > WARNING)")
+    parser.add_argument('--monit_io', type=str, help='Additional I/O monitoring for the provided process')  # TODO sanitize for interactive
     parser.add_argument('-i', '--interfaces', type=str, default='all',
                         help='Comma-separated list of network interfaces to monitor (e.g. "eth0, eth1")')
     parser.add_argument("-u", "--update", type=int, default=10, help="Update interval in seconds. [Default=10]")
@@ -59,7 +60,22 @@ def main() -> None:
         args["interfaces"] = config.get('Network', 'interfaces', fallback='')  # TODO assert?
         # print(f'> [DEBUG] cfg: {args["interfaces"]}')
 
+        # ----- IO -----
+        # IO is created manually as the IO monitoring is optional and does not need to be configured
+        try:
+            io = {"monit_io": config.getboolean('IO', 'monit_io', fallback=False)}
+            if io["monit_io"]:
+                io["process"] = config.get('IO', 'process')
+            else:
+                process = config.get('IO', 'process', fallback='')
+                if process != '':
+                    print(f'> [WARNING] Process "{process}" configured but monit_io not set!')
+        except Exception as e:
+            exit(f'Config Error! {e}')
+
         # ----- write_config -----
+        # For a sanitization of the config it is better to split off the parts that are only relevant when a config file
+        # is provided. The sanitization then mainly happens in ifnop.py. IO excluded
         # WriteOut
         WriteOut = dict(config.items('WriteOut'))
         # Influx
@@ -69,7 +85,7 @@ def main() -> None:
         # Json
         Json = dict(config.items('Json'))
         # combine
-        write_config = WriteOut | Influx | File | Json
+        write_config = WriteOut | Influx | File | Json | io
 
     # ------------------------------------
     # ----- Setup logging and config -----
