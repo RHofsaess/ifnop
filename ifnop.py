@@ -493,7 +493,6 @@ def monitor_and_send(logger: logging.Logger, selected_interfaces: list, write_co
                             logger.warning('Failed to retrieve file descriptor count.')
 
                         io_new = process.io_counters()
-                        print("WRITE:\n", io_new.write_bytes,io.write_bytes, (io_new.write_bytes - io.write_bytes) / update_interval)
                         data_point = dict(n_open_files=len(files), fd_count=fd_count, timestamp=now_influx,
                                           read_count=int(io_new.read_count), write_count=int(io_new.write_count),
                                           bytes_read=int(io_new.read_bytes), bytes_write=int(io_new.write_bytes),
