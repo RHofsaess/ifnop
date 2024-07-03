@@ -421,7 +421,7 @@ def monitor_and_send(logger: logging.Logger, selected_interfaces: list, write_co
             data_point = dict(n_open_files=len(files), fd_count=fd_count, timestamp=start_influx,
                               read_count=io.read_count,
                               write_count=io.write_count, bytes_read=io.read_bytes,
-                              bytes_write=io.write_bytes, r_rate=0, w_rate=0)
+                              bytes_write=io.write_bytes, r_rate=int(0), w_rate=int(0))
             influx_batch.append(create_influx_point(logger, influx_measurement, tag_list, data_point))
 
             # add start data to stats
@@ -495,10 +495,10 @@ def monitor_and_send(logger: logging.Logger, selected_interfaces: list, write_co
                         io_new = process.io_counters()
                         print("WRITE:\n", io_new.write_bytes,io.write_bytes, (io_new.write_bytes - io.write_bytes) / update_interval)
                         data_point = dict(n_open_files=len(files), fd_count=fd_count, timestamp=now_influx,
-                                          read_count=io_new.read_count, write_count=io_new.write_count,
-                                          bytes_read=io_new.read_bytes, bytes_write=io_new.write_bytes,
-                                          r_rate=(io_new.read_bytes-io.read_bytes) / update_interval,
-                                          w_rate=(io_new.write_bytes-io.write_bytes) / update_interval)
+                                          read_count=int(io_new.read_count), write_count=int(io_new.write_count),
+                                          bytes_read=int(io_new.read_bytes), bytes_write=int(io_new.write_bytes),
+                                          r_rate=int((io_new.read_bytes-io.read_bytes) / update_interval),
+                                          w_rate=int((io_new.write_bytes-io.write_bytes) / update_interval))
                         influx_batch.append(create_influx_point(logger, influx_measurement, tag_list, data_point))
 
                         # update the bandwidth stats for the next iteration
